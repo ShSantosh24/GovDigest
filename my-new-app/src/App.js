@@ -7,6 +7,14 @@ import HomeScreen from './screens/HomeScreen';
 const Stack = createNativeStackNavigator();
 
 export default function App() {
+  const{expoPushToken, notification} = usePushNotifications()
+  const data = JSON.stringify(notification, undefined, 2);
+
+  useEffect(() => {
+    console.log("Expo Push Token:", expoPushToken?.data);
+    console.log("Notification Data:", notification);
+  }, [expoPushToken, notification]);
+
   return (
     <NavigationContainer>
       <Stack.Navigator 
