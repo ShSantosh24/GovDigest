@@ -1,5 +1,5 @@
 // Define the endpoint URL for fetching the most recent policies
-const url = 'https://www.federalregister.gov/api/v1/documents.json?per_page=5&sort=published+desc'; // per_page=5 fetches the latest 5 documents
+const url = 'https://www.federalregister.gov/api/v1/documents.json?per_page=10&sort=published+desc'; // per_page=5 fetches the latest 5 documents
 
 // Function to fetch the latest policies
 export async function fetchNewestPolicies() {

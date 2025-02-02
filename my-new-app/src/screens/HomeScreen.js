@@ -8,12 +8,25 @@ import {
   TextInput,
   Modal,
   Button,
-} from "react-native";
+} from "react-native"; 
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  updateDoc,
+  query,
+  getDocs
+} from 'firebase/firestore'; 
+import { getAuth } from 'firebase/auth';
+import { db } from '../config/firebaseConfig';
 import { SafeAreaView } from "react-native-safe-area-context";
-import { fetchNewestPolicies } from "../api/PolicyApi";
-import { summarizeAbstract } from "../api/GeminiAPi";
 import { WebView } from "react-native-webview";
 import * as Animatable from "react-native-animatable";
+import { MaterialIcons } from '@expo/vector-icons';
+import { fetchNewestPolicies } from "../api/PolicyApi";
+import { summarizeAbstract } from "../api/GeminiAPi";
 
 export default function HomeScreen() {
   const [policies, setPolicies] = useState([]);
@@ -25,7 +38,11 @@ export default function HomeScreen() {
   const [webViewUrl, setWebViewUrl] = useState(null);
   const [webViewRef, setWebViewRef] = useState(null);
   const [canGoBack, setCanGoBack] = useState(false);
-  const [flippedCardIndex, setFlippedCardIndex] = useState(null); // Track the flipped card
+  const [flippedCardIndex, setFlippedCardIndex] = useState(null);
+  const [votingEnabled, setVotingEnabled] = useState({});
+  const [userVotes, setUserVotes] = useState({});
+  
+  const auth = getAuth();
 
   useEffect(() => {
     const getPolicies = async () => {
@@ -34,7 +51,6 @@ export default function HomeScreen() {
         if (data && data.results) {
           const publishedPolicies = data.results.filter((policy) => policy.publication_date);
   
-          // Summarize each policy's abstract and include pros and cons
           const policiesWithSummaries = await Promise.all(
             publishedPolicies.map(async (policy) => {
               const { summary, pros, cons } = await summarizeAbstract(policy.abstract);
@@ -42,8 +58,11 @@ export default function HomeScreen() {
             })
           );
   
-          setPolicies(policiesWithSummaries);
-          setFilteredPolicies(policiesWithSummaries);
+          await syncPoliciesWithFirebase(policiesWithSummaries);
+          await loadUserVotes();
+          const firebasePolicies = await getFirebasePolicies();
+          setPolicies(firebasePolicies);
+          setFilteredPolicies(firebasePolicies);
         }
       } catch (error) {
         console.error("Error fetching policies:", error);
@@ -51,10 +70,161 @@ export default function HomeScreen() {
     };
   
     getPolicies();
-  }, []);
+  }, [auth.currentUser]);
+
+  const loadUserVotes = async () => {
+    if (!auth.currentUser) {
+      setUserVotes({});
+      return;
+    }
+
+    try {
+      const userVotesRef = doc(db, 'userVotes', auth.currentUser.uid);
+      const userVotesDoc = await getDoc(userVotesRef);
+      
+      if (userVotesDoc.exists()) {
+        setUserVotes(userVotesDoc.data());
+      }
+    } catch (error) {
+      console.error("Error loading user votes:", error);
+    }
+  };
+
+  const syncPoliciesWithFirebase = async (policies) => {
+    const policiesRef = collection(db, 'policies');
+  
+    for (const policy of policies) {
+      const docRef = doc(policiesRef, policy.document_number);
+      const docSnap = await getDoc(docRef);
+  
+      if (!docSnap.exists()) {
+        await setDoc(docRef, {
+          ...policy,
+          upvotes: 0,
+          downvotes: 0,
+          createdAt: new Date().toISOString()
+        });
+      }
+    }
+  };
+
+  const getFirebasePolicies = async () => {
+    const policiesRef = collection(db, 'policies');
+    const q = query(policiesRef);
+    const querySnapshot = await getDocs(q);
+    
+    const policies = [];
+    querySnapshot.forEach((doc) => {
+      policies.push({ id: doc.id, ...doc.data() });
+    });
+    
+    return policies;
+  };
+
+  const updateUserVote = async (policyId, voteType, previousVote) => {
+    if (!auth.currentUser) return null;
+  
+    const userVotesRef = doc(db, 'userVotes', auth.currentUser.uid);
+    const policyRef = doc(db, 'policies', policyId);
+    
+    try {
+      const docSnap = await getDoc(policyRef);
+      if (docSnap.exists()) {
+        const policy = docSnap.data();
+        const updates = {};
+  
+        // If clicking the same vote type again, remove the vote
+        if (previousVote === voteType) {
+          updates[`${voteType}s`] = Math.max((policy[`${voteType}s`] || 1) - 1, 0);
+          voteType = null; // Clear the vote
+        } else {
+          // Remove previous vote if exists
+          if (previousVote) {
+            updates[`${previousVote}s`] = Math.max((policy[`${previousVote}s`] || 1) - 1, 0);
+          }
+          // Add new vote
+          if (voteType) {
+            updates[`${voteType}s`] = (policy[`${voteType}s`] || 0) + 1;
+          }
+        }
+  
+        await updateDoc(policyRef, updates);
+  
+        // Update user's vote record
+        if (voteType === null) {
+          // Remove the vote from user's records
+          const updatedVotes = { ...userVotes };
+          delete updatedVotes[policyId];
+          await setDoc(userVotesRef, updatedVotes);
+        } else {
+          // Set the new vote
+          await setDoc(userVotesRef, {
+            ...userVotes,
+            [policyId]: voteType
+          }, { merge: true });
+        }
+  
+        return { updates, voteType };
+      }
+    } catch (error) {
+      console.error("Error updating vote:", error);
+    }
+    return null;
+  };
+
+  const handleVote = async (policyId, voteType) => {
+    if (!auth.currentUser) {
+      alert("Please sign in to vote");
+      return;
+    }
+  
+    const previousVote = userVotes[policyId];
+  
+    try {
+      setVotingEnabled(prev => ({ ...prev, [policyId]: true }));
+      
+      const result = await updateUserVote(policyId, voteType, previousVote);
+      if (result) {
+        const { updates, voteType: newVoteType } = result;
+        
+        // Update user votes state
+        if (newVoteType === null) {
+          setUserVotes(prev => {
+            const newVotes = { ...prev };
+            delete newVotes[policyId];
+            return newVotes;
+          });
+        } else {
+          setUserVotes(prev => ({
+            ...prev,
+            [policyId]: newVoteType
+          }));
+        }
+  
+        // Update policies state
+        const updatedPolicies = policies.map(policy => {
+          if (policy.document_number === policyId) {
+            return {
+              ...policy,
+              upvotes: updates.upvotes !== undefined ? updates.upvotes : policy.upvotes || 0,
+              downvotes: updates.downvotes !== undefined ? updates.downvotes : policy.downvotes || 0
+            };
+          }
+          return policy;
+        });
+        
+        setPolicies(updatedPolicies);
+        setFilteredPolicies(updatedPolicies);
+      }
+    } catch (error) {
+      console.error("Error updating vote:", error);
+    } finally {
+      setVotingEnabled(prev => ({ ...prev, [policyId]: false }));
+    }
+  };
 
   const sortPolicies = (order) => {
-    if (sortOrder === order) return; // Avoid re-sorting if order is unchanged
+    if (sortOrder === order) return;
 
     const sorted = [...filteredPolicies].sort((a, b) =>
       order === "newest"
@@ -67,7 +237,7 @@ export default function HomeScreen() {
   };
 
   const filterByType = (type) => {
-    if (filterType === type) return; // Avoid re-filtering if type is unchanged
+    if (filterType === type) return;
 
     const filtered = type ? policies.filter((policy) => policy.type === type) : policies;
     setFilteredPolicies(filtered);
@@ -85,7 +255,7 @@ export default function HomeScreen() {
         (policy) =>
           policy.title?.toLowerCase().includes(lowerQuery) ||
           policy.abstract?.toLowerCase().includes(lowerQuery) ||
-          policy.summary?.toLowerCase().includes(lowerQuery) // Allow search in summaries
+          policy.summary?.toLowerCase().includes(lowerQuery)
       );
       setFilteredPolicies(results);
     }
@@ -108,7 +278,7 @@ export default function HomeScreen() {
   const renderItem = ({ item, index }) => (
     <TouchableOpacity
       style={styles.card}
-      onPress={() => setFlippedCardIndex(index === flippedCardIndex ? null : index)} // Flip card on card click
+      onPress={() => setFlippedCardIndex(index === flippedCardIndex ? null : index)}
     >
       <Animatable.View
         style={styles.cardContent}
@@ -116,27 +286,58 @@ export default function HomeScreen() {
         duration={500}
         useNativeDriver
       >
-        {/* Card Front */}
         <Text style={styles.title}>{item.title}</Text>
         <Text style={styles.type}>{item.type}</Text>
-        <Text style={styles.abstract}>{item.summary}</Text> {/* Show the summary initially */}
+        <Text style={styles.abstract}>{item.summary}</Text>
         <Text style={styles.date}>Published: {item.publication_date}</Text>
   
         {flippedCardIndex === index && (
           <View style={styles.cardBack}>
-            {/* Pros and Cons Section */}
             <Text style={styles.cardBackText}>Pros:</Text>
             <Text style={styles.cardBackText}>{item.pros}</Text>
             <Text style={styles.cardBackText}>Cons:</Text>
             <Text style={styles.cardBackText}>{item.cons}</Text>
+            
+            <View style={styles.votingContainer}>
+              <TouchableOpacity 
+                style={[
+                  styles.voteButton,
+                  userVotes[item.document_number] === 'upvote' && styles.votedButton
+                ]}
+                onPress={() => handleVote(item.document_number, 'upvote')}
+                disabled={votingEnabled[item.document_number]}
+              >
+                <MaterialIcons 
+                  name="thumb-up" 
+                  size={24} 
+                  color={userVotes[item.document_number] === 'upvote' ? "#007bff" : "#ccc"} 
+                />
+                <Text style={styles.voteCount}>{item.upvotes || 0}</Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.voteButton,
+                  userVotes[item.document_number] === 'downvote' && styles.votedButton
+                ]}
+                onPress={() => handleVote(item.document_number, 'downvote')}
+                disabled={votingEnabled[item.document_number]}
+              >
+                <MaterialIcons 
+                  name="thumb-down" 
+                  size={24} 
+                  color={userVotes[item.document_number] === 'downvote' ? "#dc3545" : "#ccc"} 
+                />
+                <Text style={styles.voteCount}>{item.downvotes || 0}</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
   
         <TouchableOpacity
           style={styles.learnMoreButton}
           onPress={() => {
-            console.log("Opening URL: ", item.html_url); // Debug log
-            setWebViewUrl(item.html_url); // Open the WebView
+            setWebViewUrl(item.html_url);
           }}
         >
           <Text style={styles.learnMoreText}>Learn More!</Text>
@@ -299,6 +500,7 @@ const styles = StyleSheet.create({
   cardBackText: {
     fontSize: 14,
     color: "#333",
+    marginBottom: 5,
   },
   modalView: {
     flex: 1,
@@ -335,4 +537,29 @@ const styles = StyleSheet.create({
   headerButtonDisabled: {
     backgroundColor: "#ccc",
   },
+  votingContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    marginTop: 15,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#eee',
+  },
+  voteButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 10,
+    borderRadius: 5,
+    backgroundColor: '#f8f9fa',
+  },
+  votedButton: {
+    backgroundColor: '#e9ecef',
+  },
+  voteCount: {
+    marginLeft: 5,
+    fontSize: 16,
+    color: '#333',
+    fontWeight: 'bold',
+  }
 });
